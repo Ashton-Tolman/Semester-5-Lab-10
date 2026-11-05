@@ -26,18 +26,33 @@
 
 // config statements should precede project file includes.
 #include <xc.inc>
-    Count10us EQU 0x70 ; delay counter 10us
-    FlagCount EQU 0x71
-    ADSWriter EQU 0x72
-    ErrorFlags EQU 0x73
-    RxByte EQU 0x74
-    DataH EQU 0x75
-    DataL EQU 0x76
-    ConfigureFlag EQU 0x77
-    RegisterPointer EQU 0x78
-    
-    Lo_threshPointer EQU 0x10
-    Hi_threshPointer EQU 0x11
+    PointerByte  EQU 0x70   ; Selected register, retained after STOP
+    RxByte       EQU 0x71   ; Received I2C data
+    RxCount      EQU 0x72   ; 0 = pointer, 1 = following data
+    TxCount      EQU 0x73   ; Number of bytes sent in this read
+    DeviceStatus EQU 0x74   ; Bit 0 = SSPOV, 1 = WCOL, 2 = bad pointer
+                            ; Bit 3 = extra write, 4 = ADC valid
+    LastReceived EQU 0x75   ; Step 2: stores 0xA5
+    DisplayByte  EQU 0x76   ; Character waiting for display
+    DisplayReady EQU 0x77   ; Bit 0 = new character
+    ADCHigh      EQU 0x78   ; Last completed 10-bit conversion
+    ADCLow       EQU 0x79
+    TxHigh       EQU 0x7A   ; Frozen ADC result for I2C transaction
+    TxLow        EQU 0x7B
+    ADCState     EQU 0x7C   ; 0 = idle, 1 = converting
+    DisplayPort  EQU 0x7D   ; Temporary PORTC display bits
+    DelayCount   EQU 0x7E
+    DelayOuter   EQU 0x7F
+
+    SlaveAddress EQU 0x40   ; 7-bit 0x20 shifted left one
+
+    ; 1 = Step 1/2 fixed byte testing
+    ; 2 = Step 3 pointer echo testing
+    ; 3 = Steps 4/5/6 full register interface
+    SlaveMode EQU 1
+
+    ; PORTB stretch: 0=normal, 1=~100us, 2=~1ms, 3=~10ms
+    StretchTest EQU 0
  
 ; Reset Vector at 000h. Execution starts here after reset 
 PSECT resetVect,class=CODE,delta=2
@@ -57,460 +72,505 @@ Setup:
     ; add device setup here
     BSF  0x03, 06	;
     BSF  0x03, 05	; Set bank 3 active
-    CLRF 0x89		; ANSELH analog/digital select portB pins as digital
-    CLRF 0x88		; ANSEL analog/digital select portA pins as digital
+    MOVLW 0x04          ; Enable analog input AN2
+    MOVWF ANSEL
+    CLRF ANSELH         ; Disable remaining analog inputs
     
     BSF  0x03, 06	;
     BCF  0x03, 5	; Set bank 2 active
-    BSF  0x09, 1	; Turn T1G-not function off
+    CLRF CM1CON0        ; Disable Comparator 1
+    CLRF CM2CON0        ; Disable Comparator 2
     
     BCF  0x03, 06	;
     BSF  0x03, 05	; Set bank 1 active 
-    BCF TRISA,0		; RA0 = NACK indicator
-    BCF TRISA,1		; RA1 = Timer diagnostic
+    BCF TRISA,0         ; RA0 = Display Write output
+    BCF TRISA,3         ; RA3 = Display data bit D6
+    BSF TRISA,2         ; RA2 = AN2 potentiometer input
     BSF TRISC,3		; RC3 = SCL
     BSF TRISC,4		; RC4 = SDA
-    CLRF SSPCON2
+    MOVLW 0xFF          ; Set all PORTB pins as inputs
+    MOVWF TRISB
+    MOVLW 0x01          ; Disable
+    MOVWF SSPCON2    
     BSF SSPSTAT,7	; Standard Speed (100 kHz)
-    
-    ;I2C clock set to 100kHz
-    MOVLW 0x09		; 4 MHz / (4 x (9 + 1))
+    MOVLW 0x40		; Slave address
     MOVWF SSPADD
-    MOVLW 0x07       
-    MOVWF OPTION_REG
-    BCF OPTION_REG,3
+    MOVLW 0x3F          ; Enable pull-ups for six switches
+    MOVWF WPUB
+    MOVLW 0x07          ; Internal clock with 1:256 prescaler
+    MOVWF OPTION_REG    ; Also enables PORTB weak pull-ups
+    MOVLW 0x80          ; Right-justified, VDD/VSS references
+    MOVWF ADCON1
 		    
     BCF  0x03, 06	;
     BCF  0x03, 05	; Set bank 0 active
+    CLRF PORTA          ; Clear PORTA outputs
+    BSF PORTA,0         ; WR starts HIGH because it is active LOW
     CLRF SSPCON
-    CLRF 0x05		; clear port A
-    CLRF 0x07		; Clear portC
-    MOVLW 0x28		; Enable MSSP, I2C Master Mode
-    MOVWF SSPCON	     
+    CLRF PORTC		; Clear portC
+    MOVLW 0x36          ; Enable MSSP, CKP = 1, 7-bit slave
+    MOVWF SSPCON    
     CLRF TMR0
     BCF INTCON,2	; Clear TMR0 overflow flag
-    
-    CLRF ADSWriter
-    CLRF ErrorFlags
+    MOVLW 0x89          ; Select AN2, Fosc/32, enable ADC
+    MOVWF ADCON0
+    BCF PIR1,3          ; SSPIF = 0
+
+    ; Clear application variables
+    CLRF PointerByte
     CLRF RxByte
-    CLRF ConfigureFlag
+    CLRF RxCount
+    CLRF TxCount
+    CLRF DeviceStatus
+    CLRF LastReceived
+    CLRF DisplayByte
+    CLRF DisplayReady
+    CLRF ADCHigh
+    CLRF ADCLow
+    CLRF TxHigh
+    CLRF TxLow
+    CLRF ADCState
+    CLRF DisplayPort
+   
 		    
     goto Main
     
 
 Main:
-    ; Start a new timer interval
-    BANKSEL TMR0
-    MOVLW 0xE4
-    MOVWF TMR0
-    BCF INTCON,2
+    BANKSEL PIR1
+    BTFSC PIR1,3	    ; If SSPIF = 1, Service I2C event
+    CALL I2CService
+    
+    ; Check if ADC needs to be updated
+    CALL ADCService
 
-TimerWait:
-    ; Wait for a Timer0 overflow
-    BTFSS INTCON,2
-    goto $-1
-    BCF INTCON,2	; Clear overflow flag
-
-    ; Timer event starts new I2C transaction
-    BANKSEL PORTA
-    BSF PORTA,1		; RA1 HIGH
-    ; CALL StepOne
-    ; CALL StepTwo
-    ; CALL StepThree
-    CALL StepFive
-    CALL StepFour
-    BANKSEL PORTA
-    BCF PORTA,1		; RA1 LOW after STOP
+    ; Check if display needs to be updated
+    CALL UpdateDisplay
     goto Main
+    
+I2CService:
+    ; Check for MSSP receive overflow or write collision
+    BANKSEL SSPCON
+    BTFSC SSPCON,6	    ; SSPOV = 1 means receive overflow
+    BSF DeviceStatus,0
+    BTFSC SSPCON,7	    ; WCOL = 1 means write collision
+    BSF DeviceStatus,1
 
-Halt:
-    BANKSEL PORTA
-    BCF PORTA,1
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    BSF PORTA,0        ; any error keeps RA0 high
-    goto Halt
-    
-StepOne:
-    MOVLW 0x92
-    MOVWF ADSWriter
-    CALL AddressProbe
-    RETURN
-    
-StepTwo:
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL SelectRegister
-    CALL ReadRegister
-    goto Halt
-    
-StepThree:
-    MOVLW 0x40
-    MOVWF DataH
-    MOVLW 0x83
-    MOVWF DataL
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CALL ReadRegister
-    goto Halt
-    
-StepFour:
-    BSF ConfigureFlag,1
-    BTFSS ConfigureFlag,0
-    goto OneTimeConfig
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CLRF RegisterPointer
-    CALL SelectRegister
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CALL ReadRegister
-    RETURN
-    
-StepFive:
-    BCF ConfigureFlag,1
-    BTFSS ConfigureFlag,0
-    goto OneTimeConfig
-    RETURN
-    
-OneTimeConfig:
-    
-    BTFSS ConfigureFlag,1
-    goto StepFiveConfig
-    
-    StepFourConfig:
-    MOVLW 0x40
-    MOVWF DataH
-    MOVLW 0x83
-    MOVWF DataL
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CALL ReadRegister
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    BSF ConfigureFlag,0
-    goto StepFour
-    
-    StepFiveConfig:
-    ;Configure Low threshold
-    MOVLW 0x02
-    MOVWF RegisterPointer
-    CLRF DataH
-    CLRF DataL
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Configure High threshold
-    MOVLW 0x03
-    MOVWF RegisterPointer
-    MOVLW 0x80
-    MOVWF DataH
-    CLRF DataL
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    MOVLW 0x40
-    MOVWF DataH
-    MOVLW 0x80
-    MOVWF DataL
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    BSF ConfigureFlag,0
-    goto StepFive
-    
-ConfigureADS:
-    ; Clear NACK indicator before each probe
-    BANKSEL PORTA
-    BCF PORTA,0		; RA0 LOW
-    
-;Select Config 
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    ;Send address with Write
-    MOVLW 0x92
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-        
-    ;Send Config pointer
-    MOVF RegisterPointer,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Send high config byte
-    MOVF DataH,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Send low config byte
-    MOVF DataL,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
+    ; Clear MSSP error flags
+    BCF SSPCON,6	    ; Clear SSPOV
+    BCF SSPCON,7	    ; Clear WCOL
 
-    ;Leave
-    CALL SendStop
-    RETURN
+    ; Determine whether the master sent an address or data
+    BANKSEL SSPSTAT
+    BTFSS SSPSTAT,5	    ; D/A = 0 means address received
+    goto AddressReceived    ; 
     
-SelectRegister:
-    ; Clear NACK indicator before each probe
-    BANKSEL PORTA
-    BCF PORTA,0		; RA0 LOW
-    
-;Select Config to be read
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    ;Send address with Write
-    MOVLW 0x92
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-        
-    ;Send Config Byte
-    MOVF RegisterPointer,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    ;Leave
-    CALL SendStop
-    RETURN
-    
-ReadRegister:
-;Read Config that is selected
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Send address with Read
-    MOVLW 0x93
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-   
-    ;Receive high byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    MOVF RxByte,W
-    MOVWF DataH
-    ;Acknolege from PIC
-    CALL SendACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Receive low byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    MOVF RxByte,W
-    MOVWF DataL
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Leave
-    CALL SendStop
-    RETURN
-    
-AddressProbe:
-    ; Clear NACK indicator before each probe
-    BANKSEL PORTA
-    BCF PORTA,0		; RA0 LOW
+    ; Check whether master is reading from slave
+    BTFSC SSPSTAT,2     ; R/W = 1 means master is reading
+    goto SlaveSend
 
-    ; Generate START condition
-    BANKSEL PIR1
-    BCF PIR1,3		; Clear SSPIF
-    BANKSEL SSPCON2
-    BSF SSPCON2,0	; SEN = 1, start I2C
+    ; Check if received data is available
+    BTFSS SSPSTAT,0     ; BF = 1 means buffer contains data
+    goto SlaveFinish
+    goto SlaveReceiveData
 
-    BTFSC SSPCON2,0	; Wait until START finishes
-    goto $-1
-
-    ; Send 7-bit address with R/W
-    BANKSEL PIR1
-    BCF PIR1,3		; Clear SSPIF
-    MOVF ADSWriter,W	; Put Shifted address into buffer
-    BANKSEL SSPBUF	; The address is moved left once, LSB = R/W bit
-    MOVWF SSPBUF	; Send address byte
-
-    BANKSEL PIR1
-    BTFSS PIR1,3	; Wait for transmission
-    goto $-1
-
-    ; Check ACK or NACK
-    BANKSEL SSPCON2
-    BTFSS SSPCON2,6	; ACKSTAT = 1 means NACK
-    goto SendStop	; ACK received
-    BANKSEL PORTA
-    BSF PORTA,0		; NACK received, RA0 HIGH
-    CALL SendStop
-    RETURN
-    
-SendStart:
-    ; Check that SCL and SDA are HIGH
-    BANKSEL PORTC
-    BTFSS PORTC,3
-    goto BusLow
-    BTFSS PORTC,4
-    goto BusLow
-
-    ; Generate START condition
-    BANKSEL PIR1
-    BCF PIR1,3		; Clear SSPIF
-    BANKSEL SSPCON2
-    BSF SSPCON2,0	; SEN = 1, start I2C
-    CALL WaitFlag
-    RETURN
-
-    BusLow:
-    BSF ErrorFlags,1
-    BANKSEL PORTA
-    BSF PORTA,0        ; RA0 HIGH
-    RETURN
-    
-SendByte:
-    ; Send One I2C Byte
-    ; Clear SSPIF
-    BANKSEL PIR1
-    BCF PIR1,3
-
-    ; Send byte
-    BANKSEL SSPBUF
-    MOVF ADSWriter,W
-    MOVWF SSPBUF
-    CALL WaitFlag
-    BTFSC ErrorFlags,2
-    RETURN
-    
-    ; Check ACK or NACK
-    BANKSEL SSPCON2
-    BTFSS SSPCON2,6
-    RETURN             ; ACK received
-
-    ; NACK received
-    BSF ErrorFlags,0
-    BANKSEL PORTA
-    BSF PORTA,0        ; RA0 HIGH
-    
-    ; Attempt STOP after NACK
-    CALL SendStop
-    RETURN 
-    
-SendStop:
-    ; Generate STOP condition
-    BANKSEL PIR1
-    BCF PIR1,3
-    BANKSEL SSPCON2
-    BSF SSPCON2,2	; PEN = 1, generate STOP
-    CALL WaitFlag
-    RETURN
-    
-SendReceive:
-    ; Receive One I2C Byte
-    ; Clear SSPIF
-    BANKSEL PIR1
-    BCF PIR1,3
-
-    ; Enable receive
-    BANKSEL SSPCON2
-    BSF SSPCON2,3      ; RCEN = 1
-    CALL WaitFlag
-
-    ; Save received byte
+AddressReceived:
+    ; Read Buffer to clear Flag
     BANKSEL SSPBUF
     MOVF SSPBUF,W
-    MOVWF RxByte
-    RETURN
-  
-SendACK:
-    ; PIC Sends ACK
+    
+    ; Check if master sent R/W
+    BANKSEL SSPSTAT
+    BTFSC SSPSTAT,2    ; 1 = Read
+    goto SlaveRead
+
+    ; Master is writing to slave
+    CLRF RxCount
+    goto SlaveFinish
+    
+; Start Slave Read Transaction
+SlaveRead:
+    CLRF TxCount        ; Start transmitted byte count at zero
+    MOVF ADCHigh,W
+    MOVWF TxHigh
+    MOVF ADCLow,W
+    MOVWF TxLow
+    goto SlaveSend  ; Prepare first byte for master
+
+; Receive Data from Master
+SlaveReceiveData:
+    ; Read incoming data byte
+    BANKSEL SSPBUF
+    MOVF SSPBUF,W
+    MOVWF RxByte        ; Save received byte
+
+    ; Check if using Step 2 fixed-byte mode
+    MOVLW SlaveMode
+    XORLW 1             ; Compare SlaveMode with 1
+    BTFSC STATUS,2
+    goto SimpleReceive
+
+    ; Check if this is the first byte after the address
+    MOVF RxCount,F
+    BTFSS STATUS,2      ; RxCount = 0 means first byte
+    goto ExtraWriteData
+
+    ; First byte is the register pointer
+    MOVF RxByte,W
+    MOVWF PointerByte   ; Save selected pointer
+    INCF RxCount,F      ; Increase received byte count
+
+    ; Step 3 accepts any pointer value for echo testing
+    MOVLW SlaveMode
+    XORLW 2
+    BTFSC STATUS,2
+    goto SlaveFinish
+
+    ; Check pointer 0x00 = DIP switches
+    MOVF PointerByte,W
+    XORLW 0x00
+    BTFSC STATUS,2
+    goto SlaveFinish
+
+    ; Check pointer 0x01 = Display
+    MOVF PointerByte,W
+    XORLW 0x01
+    BTFSC STATUS,2
+    goto SlaveFinish
+
+    ; Check pointer 0x02 = ADC
+    MOVF PointerByte,W
+    XORLW 0x02
+    BTFSC STATUS,2
+    goto SlaveFinish
+
+    ; Check pointer 0x04 = Device status
+    MOVF PointerByte,W
+    XORLW 0x04
+    BTFSC STATUS,2
+    goto SlaveFinish
+
+    ; Record invalid pointer error
+    BSF DeviceStatus,2
+    goto SlaveFinish
+
+; Step 2 - Receive Fixed Test Byte
+SimpleReceive:
+    ; Save byte sent by the master
+    MOVF RxByte,W
+    MOVWF LastReceived  ; Expected test value = 0xA5
+    goto SlaveFinish
+
+; Receive Additional Data After Pointer
+ExtraWriteData:
+    ; Check if full register mode is selected
+    MOVLW SlaveMode
+    XORLW 3
+    BTFSS STATUS,2
+    goto SlaveFinish
+
+    ; Check if display register 0x01 was selected
+    MOVF PointerByte,W
+    XORLW 0x01
+    BTFSS STATUS,2
+    goto ExtraWriteError
+
+    ; Check if this is the first data byte after pointer
+    MOVF RxCount,W
+    XORLW 0x01
+    BTFSS STATUS,2
+    goto ExtraWriteError
+
+    ; Save ASCII character for display
+    MOVF RxByte,W
+    ANDLW 0x7F          ; Keep only seven ASCII bits
+    MOVWF DisplayByte
+    BSF DisplayReady,0  ; Tell main loop to update display
+    INCF RxCount,F      ; Increase received byte count
+    goto SlaveFinish
+
+; Handle Unsupported Write Data
+ExtraWriteError:
+    BSF DeviceStatus,3  ; Record extra or unsupported data
+    goto SlaveFinish
+
+
+SlaveSend:
+    ; Check if using fixed-byte test mode
+    MOVLW SlaveMode
+    XORLW 1
+    BTFSC STATUS,2
+    goto FixedByte
+
+    ; Check if using pointer echo mode
+    MOVLW SlaveMode
+    XORLW 2
+    BTFSC STATUS,2
+    goto EchoByte
+
+    ; Pointer 0x00 = Switches
+    MOVF PointerByte,W
+    XORLW 0x00
+    BTFSC STATUS,2
+    goto SwitchByte
+
+    ; Pointer 0x02 = ADC
+    MOVF PointerByte,W
+    XORLW 0x02
+    BTFSC STATUS,2
+    goto ADCByte
+
+    ; Pointer 0x04 = Device status
+    MOVF PointerByte,W
+    XORLW 0x04
+    BTFSC STATUS,2
+    goto StatusByte
+
+    ; Invalid or write-only register requested
+    BSF DeviceStatus,2
+    MOVLW 0xEE          ; Error response byte
+    goto LoadSlaveByte
+
+; Step 2 - Send Fixed Byte
+FixedByte:
+    MOVLW 0x5A          ; Fixed response required for Step 2
+    goto LoadSlaveByte
+
+; Step 3 - Echo Register Pointer
+EchoByte:
+    MOVF PointerByte,W  ; Send the last pointer received
+    goto LoadSlaveByte
+
+; Step 4 - Read DIP Switches
+SwitchByte:
+    ; Check if this is the first byte being sent
+    MOVF TxCount,F
+    BTFSS STATUS,2
+    goto ExtraReadError
+
+    ; Apply optional clock-stretching delay
+    CALL StretchDelay
+
+    ; Read PORTB switch positions
+    BANKSEL PORTB
+    MOVF PORTB,W        ; Read all PORTB pins
+    ANDLW 0x3F          ; Keep only RB5 through RB0
+    goto LoadSlaveByte
+
+; Step 4 - Send Device Status
+StatusByte:
+    ; Check if this is the first byte being sent
+    MOVF TxCount,F
+    BTFSS STATUS,2
+    goto ExtraReadError
+
+    ; Load device status flags
+    MOVF DeviceStatus,W
+    goto LoadSlaveByte
+
+; Step 6 - Send ADC Data
+ADCByte:
+    ; Check which ADC byte the master is requesting
+    MOVF TxCount,F
+    BTFSS STATUS,2
+    goto ADCLowByte
+
+    ; Send upper ADC byte first
+    MOVF TxHigh,W       ; Upper two bits of ADC result
+    goto LoadSlaveByte
+
+ADCLowByte:
+    ; Check if master is requesting second byte
+    MOVF TxCount,W
+    XORLW 0x01
+    BTFSS STATUS,2
+    goto ExtraReadError
+
+    ; Send lower ADC byte
+    MOVF TxLow,W        ; Lower eight bits of ADC result
+    goto LoadSlaveByte
+
+; Handle Extra Read Request
+ExtraReadError:
+    ; Record that master requested too many bytes
+    BSF DeviceStatus,3
+    MOVLW 0xEE          ; Send error response byte
+
+; Load Byte into I2C Buffer
+LoadSlaveByte:
+    ; Load selected data into MSSP transmit buffer
+    BANKSEL SSPBUF
+    MOVWF SSPBUF        ; Hardware sends byte to master
+    INCF TxCount,F      ; Increase transmitted byte counter
+
+    ; Check for write collision
+    BANKSEL SSPCON
+    BTFSC SSPCON,7      ; WCOL = 1 means write collision
+    BSF DeviceStatus,1
+    BCF SSPCON,7        ; Clear write collision flag
+    goto SlaveFinish
+
+SlaveFinish:
+    ; Clear I2C interrupt flag
     BANKSEL PIR1
-    BCF PIR1,3
-    BANKSEL SSPCON2
-    BCF SSPCON2,5      ; ACKDT = 0
-    BSF SSPCON2,4      ; ACKEN = 1
-    CALL WaitFlag
+    BCF PIR1,3          ; SSPIF = 0
+
+    ; Release I2C clock line
+    BANKSEL SSPCON
+    BSF SSPCON,4        ; CKP = 1, release SCL
+    RETURN              ; Return to main loop
+
+StretchDelay:
+    ; Check selected clock-stretching test
+    ; Test 1 = Short delay
+    MOVLW StretchTest
+    XORLW 1
+    BTFSC STATUS,2
+    goto Stretch100us
+
+    ; Test 2 = Medium delay
+    MOVLW StretchTest
+    XORLW 2
+    BTFSC STATUS,2
+    goto Stretch1ms
+
+    ; Test 3 = Long delay
+    MOVLW StretchTest
+    XORLW 3
+    BTFSC STATUS,2
+    goto Stretch10ms
+    RETURN              ; No extra delay selected
+
+Stretch100us:
+    MOVLW 25           ; Load short delay count
+    MOVWF DelayCount
+
+Delay100Loop:
+    NOP                 ; Small instruction delay
+    DECFSZ DelayCount,F ; Decrease delay counter
+    goto Delay100Loop   ; Repeat until counter reaches zero
+    RETURN
+
+Stretch1ms:
+    MOVLW 10           ; Repeat short delay ten times
+    MOVWF DelayOuter
+
+Delay1msLoop:
+    CALL Stretch100us   ; Run short delay
+    DECFSZ DelayOuter,F ; Decrease outer counter
+    goto Delay1msLoop   ; Repeat until finished
+    RETURN
+
+Stretch10ms:
+    MOVLW 100          ; Repeat short delay 100 times
+    MOVWF DelayOuter
+
+Delay10msLoop:
+    CALL Stretch100us   ; Run short delay
+    DECFSZ DelayOuter,F ; Decrease outer counter
+    goto Delay10msLoop  ; Repeat until finished
+    RETURN
+
+ADCService:
+    ; Check whether ADC is currently converting
+    MOVF ADCState,F
+    BTFSC STATUS,2      ; ADCState = 0 means idle
+    goto ADCCheckTimer
+
+    ; Check if current ADC conversion has finished
+    BANKSEL ADCON0
+    BTFSC ADCON0,1      ; GO/DONE = 1 means still converting
+    RETURN
+
+    ; Read upper ADC result
+    BANKSEL ADRESH
+    MOVF ADRESH,W
+    MOVWF ADCHigh
+
+    ; Read lower ADC result
+    BANKSEL ADRESL
+    MOVF ADRESL,W
+    MOVWF ADCLow
+
+    ; Mark ADC as idle
+    CLRF ADCState
+
+    ; Indicate that a valid ADC result is available
+    BSF DeviceStatus,4
+
+; Check Timer0 for Next ADC Conversion
+ADCCheckTimer:
+    ; Check whether Timer0 has overflowed
+    BANKSEL INTCON
+    BTFSS INTCON,2      ; T0IF = 1 means overflow occurred
+    RETURN
+
+    ; Clear Timer0 overflow flag
+    BCF INTCON,2
+
+    ; Do not start another conversion if ADC is busy
+    MOVF ADCState,F
+    BTFSS STATUS,2
     RETURN
     
-SendNACK:
-    ; PIC Sends NACK 
-    BANKSEL PIR1
-    BCF PIR1,3
-    BANKSEL SSPCON2
-    BSF SSPCON2,5      ; ACKDT = 1
-    BSF SSPCON2,4      ; ACKEN = 1
-    CALL WaitFlag
+    ; Start a new ADC conversion on AN2
+    BANKSEL ADCON0
+    BSF ADCON0,1        ; GO/DONE = 1 starts conversion
+
+    ; Mark ADC as converting
+    MOVLW 1
+    MOVWF ADCState
     RETURN
-    
-WaitFlag:
-    BANKSEL PIR1	
-    MOVLW 0x0A		; Load waiting counters
-    MOVWF FlagCount
-    Waiting:
-    BTFSC PIR1,3	; Wait until START finishes
-    goto FlagDone	; Flag Detected, Return
-    CALL Delay10us	
-    DECFSZ FlagCount,F	; Count down from 10
-    goto Waiting	; Check again
-    BSF ErrorFlags,2	; When count ends, throw error
-    RETURN
-    
-    FlagDone:
-    BCF PIR1,3
-    RETURN
-    
- 
-Delay10us:
-    ; Delay loop is equal to 14 Tcy when count is 3
-    MOVLW 0x03             ; 1 Tcy move W=3 to count
-    MOVWF Count10us        ; 1 Tcy make count equal 3
-    DECFSZ Count10us,F     ; 1 Tcy if not zero, 2 Tcy if zero
-    goto $-1               ; 2 Tcy delay runs 15 times before skipping
+
+; Update DLG7137 Display
+UpdateDisplay:
+    ; Check if a new character is waiting
+    BTFSS DisplayReady,0
+    RETURN              ; Return if no update needed
+
+    ; Clear display update flag
+    BCF DisplayReady,0
+
+    ; Prepare display data bits D0 through D2
+    ; These connect to RC0, RC1, and RC2
+
+    MOVF DisplayByte,W
+    ANDLW 0x07          ; Keep lower three ASCII bits
+    MOVWF DisplayPort
+
+    ; Prepare display data bits D3 through D5
+    ; These connect to RC5, RC6, and RC7
+    MOVF DisplayByte,W
+    ANDLW 0x38          ; Keep ASCII bits 3 through 5
+    MOVWF RxByte        ; Temporarily store these bits
+
+    ; Shift bits left twice to match PORTC connections
+    BCF STATUS,0        ; Clear Carry before shifting
+    RLF RxByte,F        ; Shift left once
+    BCF STATUS,0
+    RLF RxByte,F        ; Shift left again
+
+    ; Combine lower and upper display bits
+    MOVF RxByte,W
+    IORWF DisplayPort,W ; Combine into one PORTC value
+
+    ; Output display data on PORTC
+    BANKSEL PORTC
+    MOVWF PORTC
+
+    ; Set display data bit D6 using RA3
+    BANKSEL PORTA
+    BCF PORTA,3         ; Clear D6 first
+    BTFSC DisplayByte,6 ; Check ASCII bit 6
+    BSF PORTA,3         ; Set D6 if bit 6 is HIGH
+
+    ; Send active-LOW Write pulse to display
+    ; The display reads the character when WR is pulsed LOW
+    NOP                 ; Short setup delay
+    BCF PORTA,0         ; WR LOW, write character
+    NOP
+    NOP
+    BSF PORTA,0         ; WR HIGH, finish write
     RETURN
 
 End

@@ -28,13 +28,14 @@
 #include <xc.inc>
     Count10us EQU 0x70 ; delay counter 10us
     FlagCount EQU 0x71
-    ADSWriter EQU 0x72
-    ErrorFlags EQU 0x73
-    RxByte EQU 0x74
-    DataH EQU 0x75
-    DataL EQU 0x76
-    ConfigureFlag EQU 0x77
-    RegisterPointer EQU 0x78
+    TimerLength EQU 0x72
+    ADSWriter EQU 0x73
+    ErrorFlags EQU 0x74
+    RxByte EQU 0x75
+    DataH EQU 0x76
+    DataL EQU 0x77
+    ConfigureFlag EQU 0x78
+    RegisterPointer EQU 0x79
     
     Lo_threshPointer EQU 0x10
     Hi_threshPointer EQU 0x11
@@ -94,35 +95,94 @@ Setup:
     CLRF ErrorFlags
     CLRF RxByte
     CLRF ConfigureFlag
+    CLRF DataH
+    CLRF DataL
 		    
     goto Main
     
 
 Main:
-    ; Start a new timer interval
-    BANKSEL TMR0
-    MOVLW 0xE4
-    MOVWF TMR0
-    BCF INTCON,2
+    ;Main follows each step in Part3 one by one
+    ;goto VerifyAddress
+    goto FixedWrite
+    ;goto FixedRead
 
-TimerWait:
-    ; Wait for a Timer0 overflow
-    BTFSS INTCON,2
-    goto $-1
-    BCF INTCON,2	; Clear overflow flag
-
-    ; Timer event starts new I2C transaction
-    BANKSEL PORTA
-    BSF PORTA,1		; RA1 HIGH
-    ; CALL StepOne
-    ; CALL StepTwo
-    ; CALL StepThree
-    CALL StepFive
-    CALL StepFour
-    BANKSEL PORTA
-    BCF PORTA,1		; RA1 LOW after STOP
-    goto Main
-
+FixedWrite:
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    ;If the slave address was wrong
+    ;this error would show NACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send Fixed byte
+    MOVLW 0xA5
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto FixedRead
+    
+FixedRead:
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive low byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataL
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    
+    goto Halt
+VerifyAddress:
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    ;If the slave address was wrong
+    ;this error would show NACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto Halt
 Halt:
     BANKSEL PORTA
     BCF PORTA,1
@@ -130,267 +190,7 @@ Halt:
     BTFSS STATUS,2
     BSF PORTA,0        ; any error keeps RA0 high
     goto Halt
-    
-StepOne:
-    MOVLW 0x92
-    MOVWF ADSWriter
-    CALL AddressProbe
-    RETURN
-    
-StepTwo:
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL SelectRegister
-    CALL ReadRegister
-    goto Halt
-    
-StepThree:
-    MOVLW 0x40
-    MOVWF DataH
-    MOVLW 0x83
-    MOVWF DataL
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CALL ReadRegister
-    goto Halt
-    
-StepFour:
-    BSF ConfigureFlag,1
-    BTFSS ConfigureFlag,0
-    goto OneTimeConfig
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CLRF RegisterPointer
-    CALL SelectRegister
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CALL ReadRegister
-    RETURN
-    
-StepFive:
-    BCF ConfigureFlag,1
-    BTFSS ConfigureFlag,0
-    goto OneTimeConfig
-    RETURN
-    
-OneTimeConfig:
-    
-    BTFSS ConfigureFlag,1
-    goto StepFiveConfig
-    
-    StepFourConfig:
-    MOVLW 0x40
-    MOVWF DataH
-    MOVLW 0x83
-    MOVWF DataL
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    CALL ReadRegister
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    BSF ConfigureFlag,0
-    goto StepFour
-    
-    StepFiveConfig:
-    ;Configure Low threshold
-    MOVLW 0x02
-    MOVWF RegisterPointer
-    CLRF DataH
-    CLRF DataL
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Configure High threshold
-    MOVLW 0x03
-    MOVWF RegisterPointer
-    MOVLW 0x80
-    MOVWF DataH
-    CLRF DataL
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    MOVLW 0x40
-    MOVWF DataH
-    MOVLW 0x80
-    MOVWF DataL
-    MOVLW 0x01
-    MOVWF RegisterPointer
-    CALL ConfigureADS
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    BSF ConfigureFlag,0
-    goto StepFive
-    
-ConfigureADS:
-    ; Clear NACK indicator before each probe
-    BANKSEL PORTA
-    BCF PORTA,0		; RA0 LOW
-    
-;Select Config 
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    ;Send address with Write
-    MOVLW 0x92
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-        
-    ;Send Config pointer
-    MOVF RegisterPointer,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Send high config byte
-    MOVF DataH,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Send low config byte
-    MOVF DataL,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
 
-    ;Leave
-    CALL SendStop
-    RETURN
-    
-SelectRegister:
-    ; Clear NACK indicator before each probe
-    BANKSEL PORTA
-    BCF PORTA,0		; RA0 LOW
-    
-;Select Config to be read
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    ;Send address with Write
-    MOVLW 0x92
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-        
-    ;Send Config Byte
-    MOVF RegisterPointer,W
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    ;Leave
-    CALL SendStop
-    RETURN
-    
-ReadRegister:
-;Read Config that is selected
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Send address with Read
-    MOVLW 0x93
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-   
-    ;Receive high byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    MOVF RxByte,W
-    MOVWF DataH
-    ;Acknolege from PIC
-    CALL SendACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Receive low byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    MOVF RxByte,W
-    MOVWF DataL
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    RETURN
-    
-    ;Leave
-    CALL SendStop
-    RETURN
-    
-AddressProbe:
-    ; Clear NACK indicator before each probe
-    BANKSEL PORTA
-    BCF PORTA,0		; RA0 LOW
-
-    ; Generate START condition
-    BANKSEL PIR1
-    BCF PIR1,3		; Clear SSPIF
-    BANKSEL SSPCON2
-    BSF SSPCON2,0	; SEN = 1, start I2C
-
-    BTFSC SSPCON2,0	; Wait until START finishes
-    goto $-1
-
-    ; Send 7-bit address with R/W
-    BANKSEL PIR1
-    BCF PIR1,3		; Clear SSPIF
-    MOVF ADSWriter,W	; Put Shifted address into buffer
-    BANKSEL SSPBUF	; The address is moved left once, LSB = R/W bit
-    MOVWF SSPBUF	; Send address byte
-
-    BANKSEL PIR1
-    BTFSS PIR1,3	; Wait for transmission
-    goto $-1
-
-    ; Check ACK or NACK
-    BANKSEL SSPCON2
-    BTFSS SSPCON2,6	; ACKSTAT = 1 means NACK
-    goto SendStop	; ACK received
-    BANKSEL PORTA
-    BSF PORTA,0		; NACK received, RA0 HIGH
-    CALL SendStop
-    RETURN
-    
 SendStart:
     ; Check that SCL and SDA are HIGH
     BANKSEL PORTC
@@ -404,6 +204,8 @@ SendStart:
     BCF PIR1,3		; Clear SSPIF
     BANKSEL SSPCON2
     BSF SSPCON2,0	; SEN = 1, start I2C
+    MOVLW 0x0A
+    MOVWF TimerLength
     CALL WaitFlag
     RETURN
 
@@ -423,6 +225,8 @@ SendByte:
     BANKSEL SSPBUF
     MOVF ADSWriter,W
     MOVWF SSPBUF
+    MOVLW 0x0A
+    MOVWF TimerLength
     CALL WaitFlag
     BTFSC ErrorFlags,2
     RETURN
@@ -447,6 +251,8 @@ SendStop:
     BCF PIR1,3
     BANKSEL SSPCON2
     BSF SSPCON2,2	; PEN = 1, generate STOP
+    MOVLW 0x0A
+    MOVWF TimerLength
     CALL WaitFlag
     RETURN
     
@@ -459,6 +265,8 @@ SendReceive:
     ; Enable receive
     BANKSEL SSPCON2
     BSF SSPCON2,3      ; RCEN = 1
+    MOVLW 0x0A
+    MOVWF TimerLength
     CALL WaitFlag
 
     ; Save received byte
@@ -474,6 +282,8 @@ SendACK:
     BANKSEL SSPCON2
     BCF SSPCON2,5      ; ACKDT = 0
     BSF SSPCON2,4      ; ACKEN = 1
+    MOVLW 0x0A
+    MOVWF TimerLength
     CALL WaitFlag
     RETURN
     
@@ -484,12 +294,14 @@ SendNACK:
     BANKSEL SSPCON2
     BSF SSPCON2,5      ; ACKDT = 1
     BSF SSPCON2,4      ; ACKEN = 1
+    MOVLW 0x0A
+    MOVWF TimerLength
     CALL WaitFlag
     RETURN
     
 WaitFlag:
     BANKSEL PIR1	
-    MOVLW 0x0A		; Load waiting counters
+    MOVF TimerLength,W	; Load waiting counters
     MOVWF FlagCount
     Waiting:
     BTFSC PIR1,3	; Wait until START finishes
