@@ -49,7 +49,7 @@
     ; 1 = Step 1/2 fixed byte testing
     ; 2 = Step 3 pointer echo testing
     ; 3 = Steps 4/5/6 full register interface
-    SlaveMode EQU 1
+    SlaveMode EQU 3
 
     ; PORTB stretch: 0=normal, 1=~100us, 2=~1ms, 3=~10ms
     StretchTest EQU 0
@@ -366,6 +366,10 @@ StatusByte:
 
     ; Load device status flags
     MOVF DeviceStatus,W
+    MOVWF RxByte        ; hold the value to send
+    MOVLW 0xF0
+    ANDWF DeviceStatus,F  ; clear bits 3:0 after the read
+    MOVF RxByte,W
     goto LoadSlaveByte
 
 ; Step 6 - Send ADC Data

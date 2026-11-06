@@ -104,8 +104,179 @@ Setup:
 Main:
     ;Main follows each step in Part3 one by one
     ;goto VerifyAddress
-    goto FixedWrite
+    ;goto FixedWrite
     ;goto FixedRead
+    ;goto SendEcho
+    goto ReadStatus
+    goto ReadSwitches
+    
+ReadStatus:
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send PortB Switches Pointer
+    MOVLW 0x04
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+;Read Status Register
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataH
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    goto ReadSwitches
+    
+ReadSwitches:
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send PortB Switches Pointer
+    CLRF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    
+;Read Switches from slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataH
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    goto ReadSwitches
+    
+SendEcho:
+;Send 0xA5 to slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    ;If the slave address was wrong
+    ;this error would show NACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send Fixed byte
+    MOVLW 0x3C
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    
+;Read Byte back from slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive low byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataL
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    goto Main
 
 FixedWrite:
     CALL SendStart
