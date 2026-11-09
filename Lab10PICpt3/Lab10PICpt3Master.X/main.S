@@ -109,6 +109,33 @@ Main:
     ;goto SendEcho
     goto ReadStatus
     goto ReadSwitches
+    goto SendASCIIA
+    
+SendASCIIA:
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send PortB Switches Pointer
+    MOVLW 0x01
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto Main
     
 ReadStatus:
 ;Select register pointer
@@ -218,7 +245,7 @@ ReadSwitches:
     
     ;Leave
     CALL SendStop
-    goto ReadSwitches
+    goto SendASCIIA
     
 SendEcho:
 ;Send 0xA5 to slave
@@ -375,7 +402,7 @@ SendStart:
     BCF PIR1,3		; Clear SSPIF
     BANKSEL SSPCON2
     BSF SSPCON2,0	; SEN = 1, start I2C
-    MOVLW 0x0A
+    MOVLW 0xFF
     MOVWF TimerLength
     CALL WaitFlag
     RETURN
@@ -396,7 +423,7 @@ SendByte:
     BANKSEL SSPBUF
     MOVF ADSWriter,W
     MOVWF SSPBUF
-    MOVLW 0x0A
+    MOVLW 0xFF
     MOVWF TimerLength
     CALL WaitFlag
     BTFSC ErrorFlags,2
@@ -422,7 +449,7 @@ SendStop:
     BCF PIR1,3
     BANKSEL SSPCON2
     BSF SSPCON2,2	; PEN = 1, generate STOP
-    MOVLW 0x0A
+    MOVLW 0xFF
     MOVWF TimerLength
     CALL WaitFlag
     RETURN
@@ -436,7 +463,7 @@ SendReceive:
     ; Enable receive
     BANKSEL SSPCON2
     BSF SSPCON2,3      ; RCEN = 1
-    MOVLW 0x0A
+    MOVLW 0xFF
     MOVWF TimerLength
     CALL WaitFlag
 
@@ -453,7 +480,7 @@ SendACK:
     BANKSEL SSPCON2
     BCF SSPCON2,5      ; ACKDT = 0
     BSF SSPCON2,4      ; ACKEN = 1
-    MOVLW 0x0A
+    MOVLW 0xFF
     MOVWF TimerLength
     CALL WaitFlag
     RETURN
@@ -465,7 +492,7 @@ SendNACK:
     BANKSEL SSPCON2
     BSF SSPCON2,5      ; ACKDT = 1
     BSF SSPCON2,4      ; ACKEN = 1
-    MOVLW 0x0A
+    MOVLW 0xFF
     MOVWF TimerLength
     CALL WaitFlag
     RETURN
