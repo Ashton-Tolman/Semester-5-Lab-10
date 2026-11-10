@@ -84,10 +84,10 @@ Setup:
     BCF  0x03, 06	;
     BSF  0x03, 05	; Set bank 1 active 
     BCF TRISA,0         ; RA0 = Display Write output
-    BCF TRISA,3         ; RA3 = Display data bit D6
+    BCF TRISA,1         ; RA1 = Display data bit D6
     BSF TRISA,2         ; RA2 = AN2 potentiometer input
-    BSF TRISC,3		; RC3 = SCL
-    BSF TRISC,4		; RC4 = SDA
+    MOVLW 0b00011000    ; RC3 and RC4 are inputs
+    MOVWF TRISC         ; Other PORTC pins are outputs
     MOVLW 0xFF          ; Set all PORTB pins as inputs
     MOVWF TRISB
     MOVLW 0x01          ; Disable
@@ -564,9 +564,9 @@ UpdateDisplay:
 
     ; Set display data bit D6 using RA3
     BANKSEL PORTA
-    BCF PORTA,3         ; Clear D6 first
+    BCF PORTA,1         ; Clear D6 first
     BTFSC DisplayByte,6 ; Check ASCII bit 6
-    BSF PORTA,3         ; Set D6 if bit 6 is HIGH
+    BSF PORTA,1         ; Set D6 if bit 6 is HIGH
 
     ; Send active-LOW Write pulse to display
     ; The display reads the character when WR is pulsed LOW

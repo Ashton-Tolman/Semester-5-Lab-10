@@ -134,8 +134,16 @@ SendASCIIA:
     BTFSS STATUS,2
     goto Halt
     
+    ;Send Fixed byte
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
     CALL SendStop
-    goto Main
+    goto Halt
     
 ReadStatus:
 ;Select register pointer
@@ -152,7 +160,7 @@ ReadStatus:
     BTFSS STATUS,2
     goto Halt
     
-    ;Send PortB Switches Pointer
+    ;Send register Pointer
     MOVLW 0x04
     MOVWF ADSWriter
     CALL SendByte
