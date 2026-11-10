@@ -110,6 +110,78 @@ Main:
     goto ReadStatus
     goto ReadSwitches
     goto SendASCIIA
+    ;goto ADCConversions
+    
+ADCConversions:
+    CALL WaitTimer
+    
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send register Pointer
+    MOVLW 0x02
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+;Read ADC Data from slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataH
+    
+    ;Acknolege from PIC
+    CALL SendACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataL
+    
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto Main
     
 SendASCIIA:
 ;Select register pointer
@@ -143,7 +215,7 @@ SendASCIIA:
     goto Halt
     
     CALL SendStop
-    goto Halt
+    goto ReadSwitches
     
 ReadStatus:
 ;Select register pointer
@@ -198,7 +270,7 @@ ReadStatus:
     
     ;Leave
     CALL SendStop
-    goto ReadSwitches
+    goto SendASCIIA
     
 ReadSwitches:
 ;Select register pointer
@@ -253,7 +325,7 @@ ReadSwitches:
     
     ;Leave
     CALL SendStop
-    goto SendASCIIA
+    goto ReadSwitches
     
 SendEcho:
 ;Send 0xA5 to slave
@@ -530,5 +602,28 @@ Delay10us:
     DECFSZ Count10us,F     ; 1 Tcy if not zero, 2 Tcy if zero
     goto $-1               ; 2 Tcy delay runs 15 times before skipping
     RETURN
+
+WaitTimer:
+    ; Reset Timer0
+    BANKSEL TMR0
+    CLRF TMR0          ; Start timer at zero
+    BCF INTCON,2       ; Clear overflow flag
+
+    ; Load number of Timer0 overflows
+    MOVLW 0x01
+    MOVWF TimerLength
+
+TimerWait:
+    ; Wait for Timer0 overflow
+    BTFSS INTCON,2     ; T0IF = 1 when Timer0 overflows
+    goto TimerWait
+
+    ; Clear overflow flag
+    BCF INTCON,2
+
+    ; Decrease remaining overflow count
+    DECFSZ TimerLength,F
+    goto TimerWait
+    RETURN             ; Delay finished
 
 End
