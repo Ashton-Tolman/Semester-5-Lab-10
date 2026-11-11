@@ -26,604 +26,291 @@
 
 // config statements should precede project file includes.
 #include <xc.inc>
-    Count10us EQU 0x70 ; delay counter 10us
-    FlagCount EQU 0x71
-    TimerLength EQU 0x72
-    ADSWriter EQU 0x73
-    ErrorFlags EQU 0x74
-    RxByte EQU 0x75
-    DataH EQU 0x76
-    DataL EQU 0x77
-    ConfigureFlag EQU 0x78
-    RegisterPointer EQU 0x79
-    
-    Lo_threshPointer EQU 0x10
-    Hi_threshPointer EQU 0x11
- 
-; Reset Vector at 000h. Execution starts here after reset 
+    RxBuffer      EQU 0x20         ; 24 received UART payload bytes: 0x20-0x37
+    TxBuffer      EQU 0x38         ; 24 reply payload bytes: 0x38-0x4F
+     
+    RxState       EQU 0x50         ; 0=header, 1=command, 2=length, 3=data
+    CommandByte   EQU 0x51         ; UART command from the PC
+    RequestLength EQU 0x52         ; Number of payload bytes specified by PC
+    RequestCount  EQU 0x53         ; Number of payload bytes received
+    UARTByte      EQU 0x54         ; Most recent byte received through UART
+    DeviceAddress EQU 0x55         ; 7-bit I2C address from PC
+    AddressWrite  EQU 0x56         ; Shifted 8-bit write address
+    AddressRead   EQU 0x57         ; Shifted 8-bit read address
+    BytesLeft     EQU 0x58         ; Bytes still remaining in I2C/reply transfer
+    ReplyLength   EQU 0x59         ; Number of bytes in UART reply payload
+    I2CError      EQU 0x5A         ; 0=none, 1=NACK, 2=timeout, 3=bus LOW, 4=SCL LOW
+    ErrorCategory EQU 0x5B         ; Category byte for UART error reply
+    ErrorDetail   EQU 0x5C         ; Detail byte for UART error reply
+    SendByte      EQU 0x5D         ; Byte currently being transmitted through UART
+    RxByte        EQU 0x5E         ; Last byte received from I2C device
+    WaitCount     EQU 0x5F         ; First I2C timeout counter
+    WaitOuter     EQU 0x60         ; Second I2C timeout counter
+
+; UART Command Settings
+    StartByte     EQU 0x24         ; UART packet header (0x24)
+    MaxPayload    EQU 24           ; Maximum accepted UART payload length
+    MaxRead       EQU 23           ; Maximum number of I2C bytes read
+
+; Reset Vector
 PSECT resetVect,class=CODE,delta=2
 ResetVector:
-    goto Setup
-    
-    
-; Interrupt Vector at 0004h. Execution starts here after an interrupt.
+    GOTO Setup
+
+; Interrupt Vector (not used)
 PSECT isrVect,class=CODE,delta=2
-InterruptVector:
-    RETFIE
-    
-; Main code section starts at 0008h. User code goes here
+
+; Main Code
 PSECT code,class=CODE,delta=2
 
 Setup:
-    ; add device setup here
-    BSF  0x03, 06	;
-    BSF  0x03, 05	; Set bank 3 active
-    CLRF 0x89		; ANSELH analog/digital select portB pins as digital
-    CLRF 0x88		; ANSEL analog/digital select portA pins as digital
-    
-    BSF  0x03, 06	;
-    BCF  0x03, 5	; Set bank 2 active
-    BSF  0x09, 1	; Turn T1G-not function off
-    
-    BCF  0x03, 06	;
-    BSF  0x03, 05	; Set bank 1 active 
-    BCF TRISA,0		; RA0 = NACK indicator
-    BCF TRISA,1		; RA1 = Timer diagnostic
-    BSF TRISC,3		; RC3 = SCL
-    BSF TRISC,4		; RC4 = SDA
-    CLRF SSPCON2
-    BSF SSPSTAT,7	; Standard Speed (100 kHz)
-    
-    ;I2C clock set to 100kHz
-    MOVLW 0x09		; 4 MHz / (4 x (9 + 1))
-    MOVWF SSPADD
-    MOVLW 0x07       
-    MOVWF OPTION_REG
-    BCF OPTION_REG,3
-		    
-    BCF  0x03, 06	;
-    BCF  0x03, 05	; Set bank 0 active
-    CLRF SSPCON
-    CLRF 0x05		; clear port A
-    CLRF 0x07		; Clear portC
-    MOVLW 0x28		; Enable MSSP, I2C Master Mode
-    MOVWF SSPCON	     
-    CLRF TMR0
-    BCF INTCON,2	; Clear TMR0 overflow flag
-    
-    CLRF ADSWriter
-    CLRF ErrorFlags
+    ; Disable analog inputs so the pins work as digital I/O
+    BANKSEL ANSEL
+    CLRF ANSEL                ; Disable analog inputs AN0-AN7
+    CLRF ANSELH               ; Disable remaining analog inputs
+    BANKSEL CM1CON0
+    CLRF CM1CON0              ; Disable comparator 1
+    BANKSEL CM2CON0
+    CLRF CM2CON0              ; Disable comparator 2
+
+    ; Set up PORTA diagnostic outputs
+    BANKSEL PORTA
+    CLRF PORTA                ; Start RA0 and RA1 LOW
+    BANKSEL TRISA
+    BCF TRISA,0               ; RA0 = I2C error indicator
+    BCF TRISA,1               ; RA1 = I2C transaction indicator
+
+    ; Set up I2C and UART communication pins
+    BANKSEL TRISC
+    BSF TRISC,3             ; RC3 = SCL
+    BSF TRISC,4             ; RC4 = SDA
+    BSF TRISC,6             ; RC6 = TX controlled by EUSART
+    BSF TRISC,7             ; RC7 = RX input
+
+    ; Set up MSSP for 100 kHz I2C Master Mode
+    BANKSEL SSPCON
+    CLRF SSPCON               ; Clear previous MSSP settings
+    BANKSEL SSPCON2
+    CLRF SSPCON2              ; Clear I2C control settings
+    BANKSEL SSPSTAT
+    MOVLW 0x80              ; SMP=1, standard speed
+    MOVWF SSPSTAT             ; Set standard-speed I2C operation
+
+    ; Set SCL frequency to 100 kHz with 4 MHz oscillator
+    BANKSEL SSPADD
+    MOVLW 0x09              ; 4 MHz / [4*(9+1)] = 100 kHz
+    MOVWF SSPADD              ; Set the I2C clock speed
+    BANKSEL SSPCON
+    MOVLW 0x28              ; SSPEN=1, I2C Master mode
+    MOVWF SSPCON
+    BANKSEL PIR1
+    BCF PIR1,3              ; Clear SSPIF
+
+    ; Set up UART communication at 9600 baud (8N1)
+    BANKSEL BAUDCTL
+    CLRF BAUDCTL            ; BRG16=0, normal polarity
+    BANKSEL SPBRG
+    MOVLW 25                ; 4 MHz / [16*(25+1)] ~= 9615 baud
+    MOVWF SPBRG
+    BANKSEL SPBRGH
+    CLRF SPBRGH
+    BANKSEL TXSTA
+    MOVLW 0x24              ; TXEN=1, BRGH=1, SYNC=0
+    MOVWF TXSTA               ; Enable UART transmitter
+    BANKSEL RCSTA
+    MOVLW 0x90              ; SPEN=1, CREN=1, 8-bit receive
+    MOVWF RCSTA               ; Enable UART receiver
+
+    ; Set up Timer0 for incomplete UART packet timeout
+    BANKSEL OPTION_REG
+    MOVLW 0x07              ; Prescaler 1:256 on Timer0
+    MOVWF OPTION_REG          ; Set Timer0 prescaler to 1:256
+    BANKSEL TMR0
+    CLRF TMR0                 ; Start Timer0 at zero
+    BCF INTCON,2              ; Clear Timer0 overflow flag
+
+    ; Clear variables before starting the program
+    BANKSEL RxState
+    CLRF RxState
+    CLRF CommandByte
+    CLRF RequestLength
+    CLRF RequestCount
+    CLRF UARTByte
+    CLRF DeviceAddress
+    CLRF AddressWrite
+    CLRF AddressRead
+    CLRF BytesLeft
+    CLRF ReplyLength
+    CLRF I2CError
+    CLRF ErrorCategory
+    CLRF ErrorDetail
+    CLRF SendByte
     CLRF RxByte
-    CLRF ConfigureFlag
-    CLRF DataH
-    CLRF DataL
-		    
-    goto Main
-    
+    CLRF WaitCount
+    CLRF WaitOuter
+    BCF STATUS,7            ; IRP=0: indirect buffers are in Bank 0
+   
+GOTO Main
 
 Main:
-    ;Main follows each step in Part3 one by one
-    ;goto VerifyAddress
-    ;goto FixedWrite
-    ;goto FixedRead
-    ;goto SendEcho
-    goto ReadStatus
-    goto ReadSwitches
-    goto SendASCIIA
-    ;goto ADCConversions
-    
-ADCConversions:
-    CALL WaitTimer
-    
-;Select register pointer
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send register Pointer
+    BANKSEL RCSTA
+    BTFSC RCSTA,1 ;overrun error?
+    GOTO RxRun
+    BTFSS PIR1,5 ;new byte revieced?
+    GOTO Timeout
+    BTFSC RCSTA,2 ;frame error on new byte?
+    GOTO Framing
+    BANKSEL RCREG
+    MOVF RCREG,W
+    BANKSEL UARTByte
+    MOVWF UARTByte
+    CALL ProcessUART
+    GOTO Main
+   
+RxRun:
+    CALL ClearUART
+    BANKSEL RxState
+    CLRF RxState
     MOVLW 0x02
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-;Read ADC Data from slave
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Read
-    MOVLW 0x41
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Receive byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    MOVF RxByte,W
-    MOVWF DataH
-    
-    ;Acknolege from PIC
-    CALL SendACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Receive byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    MOVF RxByte,W
-    MOVWF DataL
-    
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-    goto Main
-    
-SendASCIIA:
-;Select register pointer
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send PortB Switches Pointer
-    MOVLW 0x01
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send Fixed byte
-    MOVLW 0x41
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-    goto ReadSwitches
-    
-ReadStatus:
-;Select register pointer
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send register Pointer
-    MOVLW 0x04
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-;Read Status Register
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Read
-    MOVLW 0x41
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Receive byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    MOVF RxByte,W
-    MOVWF DataH
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Leave
-    CALL SendStop
-    goto SendASCIIA
-    
-ReadSwitches:
-;Select register pointer
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send PortB Switches Pointer
-    CLRF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-    
-;Read Switches from slave
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Read
-    MOVLW 0x41
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Receive byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    MOVF RxByte,W
-    MOVWF DataH
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Leave
-    CALL SendStop
-    goto ReadSwitches
-    
-SendEcho:
-;Send 0xA5 to slave
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    ;If the slave address was wrong
-    ;this error would show NACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send Fixed byte
-    MOVLW 0x3C
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-    
-;Read Byte back from slave
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Read
-    MOVLW 0x41
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Receive low byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    MOVF RxByte,W
-    MOVWF DataL
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Leave
-    CALL SendStop
-    goto Main
+    MOVWF ErrorCategory
+    CLRF ErrorDetail
+    CALL SendErrorPacket
+    GOTO Main
 
-FixedWrite:
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    ;If the slave address was wrong
-    ;this error would show NACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send Fixed byte
-    MOVLW 0xA5
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-    goto FixedRead
-    
-FixedRead:
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Read
-    MOVLW 0x41
-    MOVWF ADSWriter
-    CALL SendByte
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Receive low byte
-    CALL SendReceive
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    MOVF RxByte,W
-    MOVWF DataL
-    ;Non acknolege from PIC
-    CALL SendNACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Leave
-    CALL SendStop
-    
-    goto Halt
-VerifyAddress:
-    CALL SendStart
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    ;Send address with Write
-    MOVLW 0x40
-    MOVWF ADSWriter
-    CALL SendByte
-    ;If the slave address was wrong
-    ;this error would show NACK
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    goto Halt
-    
-    CALL SendStop
-    goto Halt
-Halt:
-    BANKSEL PORTA
-    BCF PORTA,1
-    MOVF ErrorFlags,F
-    BTFSS STATUS,2
-    BSF PORTA,0        ; any error keeps RA0 high
-    goto Halt
-
-SendStart:
-    ; Check that SCL and SDA are HIGH
-    BANKSEL PORTC
-    BTFSS PORTC,3
-    goto BusLow
-    BTFSS PORTC,4
-    goto BusLow
-
-    ; Generate START condition
-    BANKSEL PIR1
-    BCF PIR1,3		; Clear SSPIF
-    BANKSEL SSPCON2
-    BSF SSPCON2,0	; SEN = 1, start I2C
-    MOVLW 0xFF
-    MOVWF TimerLength
-    CALL WaitFlag
-    RETURN
-
-    BusLow:
-    BSF ErrorFlags,1
-    BANKSEL PORTA
-    BSF PORTA,0        ; RA0 HIGH
-    RETURN
-    
-SendByte:
-    ; Send One I2C Byte
-    ; Clear SSPIF
-    BANKSEL PIR1
-    BCF PIR1,3
-
-    ; Send byte
-    BANKSEL SSPBUF
-    MOVF ADSWriter,W
-    MOVWF SSPBUF
-    MOVLW 0xFF
-    MOVWF TimerLength
-    CALL WaitFlag
-    BTFSC ErrorFlags,2
-    RETURN
-    
-    ; Check ACK or NACK
-    BANKSEL SSPCON2
-    BTFSS SSPCON2,6
-    RETURN             ; ACK received
-
-    ; NACK received
-    BSF ErrorFlags,0
-    BANKSEL PORTA
-    BSF PORTA,0        ; RA0 HIGH
-    
-    ; Attempt STOP after NACK
-    CALL SendStop
-    RETURN 
-    
-SendStop:
-    ; Generate STOP condition
-    BANKSEL PIR1
-    BCF PIR1,3
-    BANKSEL SSPCON2
-    BSF SSPCON2,2	; PEN = 1, generate STOP
-    MOVLW 0xFF
-    MOVWF TimerLength
-    CALL WaitFlag
-    RETURN
-    
-SendReceive:
-    ; Receive One I2C Byte
-    ; Clear SSPIF
-    BANKSEL PIR1
-    BCF PIR1,3
-
-    ; Enable receive
-    BANKSEL SSPCON2
-    BSF SSPCON2,3      ; RCEN = 1
-    MOVLW 0xFF
-    MOVWF TimerLength
-    CALL WaitFlag
-
-    ; Save received byte
-    BANKSEL SSPBUF
-    MOVF SSPBUF,W
-    MOVWF RxByte
-    RETURN
-  
-SendACK:
-    ; PIC Sends ACK
-    BANKSEL PIR1
-    BCF PIR1,3
-    BANKSEL SSPCON2
-    BCF SSPCON2,5      ; ACKDT = 0
-    BSF SSPCON2,4      ; ACKEN = 1
-    MOVLW 0xFF
-    MOVWF TimerLength
-    CALL WaitFlag
-    RETURN
-    
-SendNACK:
-    ; PIC Sends NACK 
-    BANKSEL PIR1
-    BCF PIR1,3
-    BANKSEL SSPCON2
-    BSF SSPCON2,5      ; ACKDT = 1
-    BSF SSPCON2,4      ; ACKEN = 1
-    MOVLW 0xFF
-    MOVWF TimerLength
-    CALL WaitFlag
-    RETURN
-    
-WaitFlag:
-    BANKSEL PIR1	
-    MOVF TimerLength,W	; Load waiting counters
-    MOVWF FlagCount
-    Waiting:
-    BTFSC PIR1,3	; Wait until START finishes
-    goto FlagDone	; Flag Detected, Return
-    CALL Delay10us	
-    DECFSZ FlagCount,F	; Count down from 10
-    goto Waiting	; Check again
-    BSF ErrorFlags,2	; When count ends, throw error
-    RETURN
-    
-    FlagDone:
-    BCF PIR1,3
-    RETURN
-    
- 
-Delay10us:
-    ; Delay loop is equal to 14 Tcy when count is 3
-    MOVLW 0x03             ; 1 Tcy move W=3 to count
-    MOVWF Count10us        ; 1 Tcy make count equal 3
-    DECFSZ Count10us,F     ; 1 Tcy if not zero, 2 Tcy if zero
-    goto $-1               ; 2 Tcy delay runs 15 times before skipping
-    RETURN
-
-WaitTimer:
-    ; Reset Timer0
+ClearUART:
+    BANKSEL RCSTA  
+    BCF RCSTA,4
+    BSF RCSTA,4 ;reset/clear the reciever
     BANKSEL TMR0
-    CLRF TMR0          ; Start timer at zero
-    BCF INTCON,2       ; Clear overflow flag
-
-    ; Load number of Timer0 overflows
-    MOVLW 0x01
-    MOVWF TimerLength
-
-TimerWait:
-    ; Wait for Timer0 overflow
-    BTFSS INTCON,2     ; T0IF = 1 when Timer0 overflows
-    goto TimerWait
-
-    ; Clear overflow flag
+    CLRF TMR0
     BCF INTCON,2
 
-    ; Decrease remaining overflow count
-    DECFSZ TimerLength,F
-    goto TimerWait
-    RETURN             ; Delay finished
+ClearLoop:
+    BANKSEL PIR1
+    BTFSS PIR1,5
+    GOTO ClearLoop
+    BANKSEL RCREG,W
+    BANKSEL TMR0
+    CLRF TMR0
+    BCF INTCON,2
+    GOTO ClearLoop
+ 
+ClearWait:
+    BANKSEL INTCON
+    BTFSS INTCON,2
+    GOTO ClearUART
+    RETURN
 
-End
+UARTsend:
+    BANKSEL SendByte
+    MOVWF SendByte
+   
+UARTsendTWO:
+    BANKSEL PIR1
+    BTFSS PIR1,4
+    GOTO UARTsendTWO
+    BANKSEL SendByte
+    MOVF SendByte,W
+    BANKSEL TXREG
+    MOVWF TXREG
+    RETURN
+ 
+SendErrorPacket:
+    ; Send UART/I2C/validation error information to the GUI
+    MOVLW StartByte
+    CALL UARTSend
+    MOVLW 0x45
+    CALL UARTSend
+    MOVLW 0x02
+    CALL UARTSend
+    BANKSEL ErrorCategory
+    MOVF ErrorCategory,W
+    CALL UARTSend
+    BANKSEL ErrorDetail
+    MOVF ErrorDetail,W
+    CALL UARTSend
+    RETURN
+   
+Timeout:
+    BANKSEL RxState
+    MOVF RxState,F
+    BTFSC STATUS,2
+    GOTO Main
+    BANKSEL INTCON
+    BTFSS INTCON,2
+    GOTO Main
+    BANKSEL RxState
+    CLRF RxState
+    MOVLW 0x05
+    MOVWF ErrorCategory
+    MOVLW 0x01
+    MOVWF ErrorDetail
+    CALL SendErrorPacket
+    GOTO Main
+   
+Framing:
+    BANKSEL RCREG
+    MOVF RCREG,W ;discard bad byte
+    CALL ClearUART
+    BANKSEL RxState
+    CLRF RxState
+    MOVLW 0x01
+    MOVWF ErrorCategoy
+    CLRF ErrorDetail
+    CALL SendErrorPacket
+    GOTO Main
+   
+ProcessUART:
+    BANKSEL TMR0
+    CLRF TMR0
+    BCF INTCON,2
+    BANKSEL RxState
+    MOVF RxState,W
+    XORLW 0
+    BTFSC STATUS,2
+    GOTO ReceiveHeader
+    MOVF RxState,W
+    XORLW 1
+    BTFSC STATUS,2
+    GOTO ReceiveCommand
+    MOVF RxState,W
+    XORLW 2
+    BTFSC STATUS,2
+    GOTO ReceiveLength
+    GOTO ReceivePayload
+   
+ReceiveHeader:
+    MOVF UARTByte,W
+    XORLW 0x24
+    BTFSS STATUS,2 ;does the packet start with 24/$?
+    RETURN ;no $ we wait
+    MOVLW 0x01
+    MOVWF RxState ;yes $, now move to command
+    RETURN
+
+ReceiveCommand:
+    MOVF UARTByte,W
+    MOVWF CommandByte ;save what was requested
+    MOVLW 0x02
+    MOVWF RxState
+    RETURN
+   
+ReceiveLength:
+    MOVF UARTByte,W
+    MOVWF RequestLength
+    CLRF RequestCount
+    MOVF RequestLength,F
+    BTFSC STATUS,2
+    GOTO ProcessRequest
+   
+    MOVLW 3
+    MOVWF RxState
+    RETURN
+   
+ReceivePayload:
+
+   
+   
+
+   
+   
