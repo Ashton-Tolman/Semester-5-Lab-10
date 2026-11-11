@@ -177,6 +177,12 @@ RxRun:
     CALL SendErrorPacket
     GOTO Main
 
+ClearWait:
+    BANKSEL INTCON
+    BTFSS INTCON,2
+    GOTO ClearUART
+    RETURN
+    
 ClearUART:
     BANKSEL RCSTA  
     BCF RCSTA,4
@@ -194,12 +200,6 @@ ClearLoop:
     CLRF TMR0
     BCF INTCON,2
     GOTO ClearLoop
- 
-ClearWait:
-    BANKSEL INTCON
-    BTFSS INTCON,2
-    GOTO ClearUART
-    RETURN
 
 UARTsend:
     BANKSEL SendByte
@@ -308,9 +308,81 @@ ReceiveLength:
     RETURN
    
 ReceivePayload:
+    MOVF RequestCount,W
+    SUBLW 23                 ; Carry set when count <= 23
+    BTFSS STATUS,0
+    GOTO SkipStorage
+    MOVF RequestCount,W
+    ADDLW RxBuffer
+    BANKSEL FSR
+    MOVWF FSR
+    BANKSEL UARTByte
+    MOVF UARTByte,W
+    BANKSEL INDF
+    MOVWF INDF
 
-   
-   
+SkipStorage:
+    ; Count all received bytes even if the request is oversized
+    BANKSEL RequestCount
+    INCF RequestCount,F
+    MOVF RequestLength,W
+    XORWF RequestCount,W
+    BTFSS STATUS,2
+    RETURN
 
+PacketReady:
+    ; Process the packet after all declared bytes arrive
+    BANKSEL RxState
+    CLRF RxState
+    CALL ProcessRequest       ; Run command after full packet arrives
+    RETURN
    
    
+ProccessRequest:
+    BANKSEL RxState
+    CLRF RxState
+    ; Reject any payload longer than 24 bytes before using I2C
+    BANKSEL RequestLength
+    MOVF RequestLength,W
+    SUBLW 0x24
+    BTFSS STATUS,0
+    GOTO InvalidLength
+
+    ; Compare command with Identity (0x49), Probe (0x50),
+    MOVF CommandByte,W
+    XORLW 0x49
+    BTFSC STATUS,2
+    GOTO IdentityCommand
+    MOVF CommandByte,W
+    XORLW 0x50
+    BTFSC STATUS,2
+    GOTO ProbeCommand
+    MOVF CommandByte,W
+    XORLW 0x57
+    BTFSC STATUS,2
+    GOTO WriteCommand
+    MOVF CommandByte,W
+    XORLW 0x52
+    BTFSC STATUS,2
+    GOTO ReadCommand
+
+    ; Report an unknown UART command
+    MOVLW 0x05
+    MOVWF ErrorCategory
+    MOVLW 0x02
+    MOVWF ErrorDetail
+    CALL SendErrorPacket
+    RETURN
+   
+; Return bridge validation error for invalid packet length
+InvalidLength:
+    BANKSEL ErrorCategory
+    MOVLW 0x05
+    MOVWF ErrorCategory
+    MOVLW 0x01
+    MOVWF ErrorDetail
+
+; Send the error packet without starting I2C
+SendValidationError:
+    CALL SendErrorPacket
+    RETURN
