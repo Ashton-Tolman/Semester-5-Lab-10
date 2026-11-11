@@ -1,0 +1,629 @@
+// Ashton Tolman
+// RCET3373
+// Lab10PICpt4Master
+// https://github.com/Ashton-Tolman/Semester-5-Lab-10.git
+// linker code:-Wl,-presetVect=0000h,-pisrVect=0004h,-pcode=0008h
+
+; PIC16F883 Configuration Bit Settings
+
+; Assembly source line config statements
+
+; CONFIG1
+  CONFIG  FOSC = XT             ; Oscillator Selection bits (XT oscillator: Crystal/resonator on RA6/OSC2/CLKOUT and RA7/OSC1/CLKIN)
+  CONFIG  WDTE = OFF            ; Watchdog Timer Enable bit (WDT disabled and can be enabled by SWDTEN bit of the WDTCON register)
+  CONFIG  PWRTE = OFF           ; Power-up Timer Enable bit (PWRT disabled)
+  CONFIG  MCLRE = ON            ; RE3/MCLR pin function select bit (RE3/MCLR pin function is MCLR)
+  CONFIG  CP = OFF              ; Code Protection bit (Program memory code protection is disabled)
+  CONFIG  CPD = OFF             ; Data Code Protection bit (Data memory code protection is disabled)
+  CONFIG  BOREN = OFF           ; Brown Out Reset Selection bits (BOR disabled)
+  CONFIG  IESO = OFF            ; Internal External Switchover bit (Internal/External Switchover mode is disabled)
+  CONFIG  FCMEN = OFF           ; Fail-Safe Clock Monitor Enabled bit (Fail-Safe Clock Monitor is disabled)
+  CONFIG  LVP = OFF             ; Low Voltage Programming Enable bit (RB3 pin has digital I/O, HV on MCLR must be used for programming)
+
+; CONFIG2
+  CONFIG  BOR4V = BOR40V        ; Brown-out Reset Selection bit (Brown-out Reset set to 4.0V)
+  CONFIG  WRT = OFF             ; Flash Program Memory Self Write Enable bits (Write protection off)
+
+// config statements should precede project file includes.
+#include <xc.inc>
+    Count10us EQU 0x70 ; delay counter 10us
+    FlagCount EQU 0x71
+    TimerLength EQU 0x72
+    ADSWriter EQU 0x73
+    ErrorFlags EQU 0x74
+    RxByte EQU 0x75
+    DataH EQU 0x76
+    DataL EQU 0x77
+    ConfigureFlag EQU 0x78
+    RegisterPointer EQU 0x79
+    
+    Lo_threshPointer EQU 0x10
+    Hi_threshPointer EQU 0x11
+ 
+; Reset Vector at 000h. Execution starts here after reset 
+PSECT resetVect,class=CODE,delta=2
+ResetVector:
+    goto Setup
+    
+    
+; Interrupt Vector at 0004h. Execution starts here after an interrupt.
+PSECT isrVect,class=CODE,delta=2
+InterruptVector:
+    RETFIE
+    
+; Main code section starts at 0008h. User code goes here
+PSECT code,class=CODE,delta=2
+
+Setup:
+    ; add device setup here
+    BSF  0x03, 06	;
+    BSF  0x03, 05	; Set bank 3 active
+    CLRF 0x89		; ANSELH analog/digital select portB pins as digital
+    CLRF 0x88		; ANSEL analog/digital select portA pins as digital
+    
+    BSF  0x03, 06	;
+    BCF  0x03, 5	; Set bank 2 active
+    BSF  0x09, 1	; Turn T1G-not function off
+    
+    BCF  0x03, 06	;
+    BSF  0x03, 05	; Set bank 1 active 
+    BCF TRISA,0		; RA0 = NACK indicator
+    BCF TRISA,1		; RA1 = Timer diagnostic
+    BSF TRISC,3		; RC3 = SCL
+    BSF TRISC,4		; RC4 = SDA
+    CLRF SSPCON2
+    BSF SSPSTAT,7	; Standard Speed (100 kHz)
+    
+    ;I2C clock set to 100kHz
+    MOVLW 0x09		; 4 MHz / (4 x (9 + 1))
+    MOVWF SSPADD
+    MOVLW 0x07       
+    MOVWF OPTION_REG
+    BCF OPTION_REG,3
+		    
+    BCF  0x03, 06	;
+    BCF  0x03, 05	; Set bank 0 active
+    CLRF SSPCON
+    CLRF 0x05		; clear port A
+    CLRF 0x07		; Clear portC
+    MOVLW 0x28		; Enable MSSP, I2C Master Mode
+    MOVWF SSPCON	     
+    CLRF TMR0
+    BCF INTCON,2	; Clear TMR0 overflow flag
+    
+    CLRF ADSWriter
+    CLRF ErrorFlags
+    CLRF RxByte
+    CLRF ConfigureFlag
+    CLRF DataH
+    CLRF DataL
+		    
+    goto Main
+    
+
+Main:
+    ;Main follows each step in Part3 one by one
+    ;goto VerifyAddress
+    ;goto FixedWrite
+    ;goto FixedRead
+    ;goto SendEcho
+    goto ReadStatus
+    goto ReadSwitches
+    goto SendASCIIA
+    ;goto ADCConversions
+    
+ADCConversions:
+    CALL WaitTimer
+    
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send register Pointer
+    MOVLW 0x02
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+;Read ADC Data from slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataH
+    
+    ;Acknolege from PIC
+    CALL SendACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataL
+    
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto Main
+    
+SendASCIIA:
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send PortB Switches Pointer
+    MOVLW 0x01
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send Fixed byte
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto ReadSwitches
+    
+ReadStatus:
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send register Pointer
+    MOVLW 0x04
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+;Read Status Register
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataH
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    goto SendASCIIA
+    
+ReadSwitches:
+;Select register pointer
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send PortB Switches Pointer
+    CLRF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    
+;Read Switches from slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataH
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    goto ReadSwitches
+    
+SendEcho:
+;Send 0xA5 to slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    ;If the slave address was wrong
+    ;this error would show NACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send Fixed byte
+    MOVLW 0x3C
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    
+;Read Byte back from slave
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive low byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataL
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    goto Main
+
+FixedWrite:
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    ;If the slave address was wrong
+    ;this error would show NACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send Fixed byte
+    MOVLW 0xA5
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto FixedRead
+    
+FixedRead:
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Read
+    MOVLW 0x41
+    MOVWF ADSWriter
+    CALL SendByte
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Receive low byte
+    CALL SendReceive
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    MOVF RxByte,W
+    MOVWF DataL
+    ;Non acknolege from PIC
+    CALL SendNACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Leave
+    CALL SendStop
+    
+    goto Halt
+VerifyAddress:
+    CALL SendStart
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    ;Send address with Write
+    MOVLW 0x40
+    MOVWF ADSWriter
+    CALL SendByte
+    ;If the slave address was wrong
+    ;this error would show NACK
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    goto Halt
+    
+    CALL SendStop
+    goto Halt
+Halt:
+    BANKSEL PORTA
+    BCF PORTA,1
+    MOVF ErrorFlags,F
+    BTFSS STATUS,2
+    BSF PORTA,0        ; any error keeps RA0 high
+    goto Halt
+
+SendStart:
+    ; Check that SCL and SDA are HIGH
+    BANKSEL PORTC
+    BTFSS PORTC,3
+    goto BusLow
+    BTFSS PORTC,4
+    goto BusLow
+
+    ; Generate START condition
+    BANKSEL PIR1
+    BCF PIR1,3		; Clear SSPIF
+    BANKSEL SSPCON2
+    BSF SSPCON2,0	; SEN = 1, start I2C
+    MOVLW 0xFF
+    MOVWF TimerLength
+    CALL WaitFlag
+    RETURN
+
+    BusLow:
+    BSF ErrorFlags,1
+    BANKSEL PORTA
+    BSF PORTA,0        ; RA0 HIGH
+    RETURN
+    
+SendByte:
+    ; Send One I2C Byte
+    ; Clear SSPIF
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Send byte
+    BANKSEL SSPBUF
+    MOVF ADSWriter,W
+    MOVWF SSPBUF
+    MOVLW 0xFF
+    MOVWF TimerLength
+    CALL WaitFlag
+    BTFSC ErrorFlags,2
+    RETURN
+    
+    ; Check ACK or NACK
+    BANKSEL SSPCON2
+    BTFSS SSPCON2,6
+    RETURN             ; ACK received
+
+    ; NACK received
+    BSF ErrorFlags,0
+    BANKSEL PORTA
+    BSF PORTA,0        ; RA0 HIGH
+    
+    ; Attempt STOP after NACK
+    CALL SendStop
+    RETURN 
+    
+SendStop:
+    ; Generate STOP condition
+    BANKSEL PIR1
+    BCF PIR1,3
+    BANKSEL SSPCON2
+    BSF SSPCON2,2	; PEN = 1, generate STOP
+    MOVLW 0xFF
+    MOVWF TimerLength
+    CALL WaitFlag
+    RETURN
+    
+SendReceive:
+    ; Receive One I2C Byte
+    ; Clear SSPIF
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Enable receive
+    BANKSEL SSPCON2
+    BSF SSPCON2,3      ; RCEN = 1
+    MOVLW 0xFF
+    MOVWF TimerLength
+    CALL WaitFlag
+
+    ; Save received byte
+    BANKSEL SSPBUF
+    MOVF SSPBUF,W
+    MOVWF RxByte
+    RETURN
+  
+SendACK:
+    ; PIC Sends ACK
+    BANKSEL PIR1
+    BCF PIR1,3
+    BANKSEL SSPCON2
+    BCF SSPCON2,5      ; ACKDT = 0
+    BSF SSPCON2,4      ; ACKEN = 1
+    MOVLW 0xFF
+    MOVWF TimerLength
+    CALL WaitFlag
+    RETURN
+    
+SendNACK:
+    ; PIC Sends NACK 
+    BANKSEL PIR1
+    BCF PIR1,3
+    BANKSEL SSPCON2
+    BSF SSPCON2,5      ; ACKDT = 1
+    BSF SSPCON2,4      ; ACKEN = 1
+    MOVLW 0xFF
+    MOVWF TimerLength
+    CALL WaitFlag
+    RETURN
+    
+WaitFlag:
+    BANKSEL PIR1	
+    MOVF TimerLength,W	; Load waiting counters
+    MOVWF FlagCount
+    Waiting:
+    BTFSC PIR1,3	; Wait until START finishes
+    goto FlagDone	; Flag Detected, Return
+    CALL Delay10us	
+    DECFSZ FlagCount,F	; Count down from 10
+    goto Waiting	; Check again
+    BSF ErrorFlags,2	; When count ends, throw error
+    RETURN
+    
+    FlagDone:
+    BCF PIR1,3
+    RETURN
+    
+ 
+Delay10us:
+    ; Delay loop is equal to 14 Tcy when count is 3
+    MOVLW 0x03             ; 1 Tcy move W=3 to count
+    MOVWF Count10us        ; 1 Tcy make count equal 3
+    DECFSZ Count10us,F     ; 1 Tcy if not zero, 2 Tcy if zero
+    goto $-1               ; 2 Tcy delay runs 15 times before skipping
+    RETURN
+
+WaitTimer:
+    ; Reset Timer0
+    BANKSEL TMR0
+    CLRF TMR0          ; Start timer at zero
+    BCF INTCON,2       ; Clear overflow flag
+
+    ; Load number of Timer0 overflows
+    MOVLW 0x01
+    MOVWF TimerLength
+
+TimerWait:
+    ; Wait for Timer0 overflow
+    BTFSS INTCON,2     ; T0IF = 1 when Timer0 overflows
+    goto TimerWait
+
+    ; Clear overflow flag
+    BCF INTCON,2
+
+    ; Decrease remaining overflow count
+    DECFSZ TimerLength,F
+    goto TimerWait
+    RETURN             ; Delay finished
+
+End
