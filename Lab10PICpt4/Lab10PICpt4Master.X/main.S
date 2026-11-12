@@ -155,7 +155,7 @@ GOTO Main
 Main:
     BANKSEL RCSTA
     BTFSC RCSTA,1 ;overrun error?
-    GOTO RxRun
+    GOTO OverRun
     BTFSS PIR1,5 ;new byte revieced?
     GOTO Timeout
     BTFSC RCSTA,2 ;frame error on new byte?
@@ -167,7 +167,7 @@ Main:
     CALL ProcessUART
     GOTO Main
    
-RxRun:
+OverRun:
     CALL ClearUART
     BANKSEL RxState
     CLRF RxState
@@ -177,11 +177,6 @@ RxRun:
     CALL SendErrorPacket
     GOTO Main
 
-ClearWait:
-    BANKSEL INTCON
-    BTFSS INTCON,2
-    GOTO ClearUART
-    RETURN
     
 ClearUART:
     BANKSEL RCSTA  
@@ -194,12 +189,19 @@ ClearUART:
 ClearLoop:
     BANKSEL PIR1
     BTFSS PIR1,5
-    GOTO ClearLoop
-    BANKSEL RCREG,W
+    GOTO ClearWait
+    BANKSEL RCREG
+    MOVF RCREG,W
     BANKSEL TMR0
     CLRF TMR0
     BCF INTCON,2
     GOTO ClearLoop
+    
+ClearWait:
+    BANKSEL INTCON
+    BTFSS INTCON,2
+    GOTO ClearLoop
+    RETURN
 
 UARTsend:
     BANKSEL SendByte
@@ -213,22 +215,6 @@ UARTsendTWO:
     MOVF SendByte,W
     BANKSEL TXREG
     MOVWF TXREG
-    RETURN
- 
-SendErrorPacket:
-    ; Send UART/I2C/validation error information to the GUI
-    MOVLW StartByte
-    CALL UARTSend
-    MOVLW 0x45
-    CALL UARTSend
-    MOVLW 0x02
-    CALL UARTSend
-    BANKSEL ErrorCategory
-    MOVF ErrorCategory,W
-    CALL UARTSend
-    BANKSEL ErrorDetail
-    MOVF ErrorDetail,W
-    CALL UARTSend
     RETURN
    
 Timeout:
@@ -255,7 +241,7 @@ Framing:
     BANKSEL RxState
     CLRF RxState
     MOVLW 0x01
-    MOVWF ErrorCategoy
+    MOVWF ErrorCategory
     CLRF ErrorDetail
     CALL SendErrorPacket
     GOTO Main
@@ -301,8 +287,7 @@ ReceiveLength:
     CLRF RequestCount
     MOVF RequestLength,F
     BTFSC STATUS,2
-    GOTO ProcessRequest
-   
+    GOTO PacketReady
     MOVLW 3
     MOVWF RxState
     RETURN
@@ -332,13 +317,6 @@ SkipStorage:
 
 PacketReady:
     ; Process the packet after all declared bytes arrive
-    BANKSEL RxState
-    CLRF RxState
-    CALL ProcessRequest       ; Run command after full packet arrives
-    RETURN
-   
-   
-ProccessRequest:
     BANKSEL RxState
     CLRF RxState
     ; Reject any payload longer than 24 bytes before using I2C
@@ -373,7 +351,205 @@ ProccessRequest:
     MOVWF ErrorDetail
     CALL SendErrorPacket
     RETURN
-   
+    
+IdentityCommand:
+    ; Identity request must have zero payload bytes
+    MOVF RequestLength,F
+    BTFSS STATUS,2
+    GOTO InvalidLength
+    MOVLW 0x33                ; First device ID byte
+    MOVWF TxBuffer
+    MOVLW 0x75                ; Second device ID byte
+    MOVWF TxBuffer+1
+    MOVLW 2                   ; Return two identity bytes
+    MOVWF ReplyLength
+    CALL SendReply
+    RETURN
+
+ProbeCommand:
+    ; Probe command requires one address byte
+    MOVF RequestLength,W
+    XORLW 1
+    BTFSS STATUS,2
+    GOTO InvalidLength
+    CALL CheckAddress
+    MOVF ErrorCategory,F
+    BTFSS STATUS,2
+    GOTO SendValidationError
+    CALL BeginI2C
+    CALL I2CStart
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO ProbeStop
+    MOVF AddressWrite,W
+    CALL I2CSend
+
+ProbeStop:
+    CALL I2CStop
+    GOTO FinishI2C
+
+WriteCommand:
+    ; Write request requires an address and at least one data byte
+    MOVF RequestLength,W
+    SUBLW 1                  ; Reject lengths 0 and 1
+    BTFSC STATUS,0
+    GOTO InvalidLength
+    CALL CheckAddress
+    MOVF ErrorCategory,F
+    BTFSS STATUS,2
+    GOTO SendValidationError
+    CALL BeginI2C
+    CALL I2CStart
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO WriteStop
+    MOVF AddressWrite,W
+    CALL I2CSend
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO WriteStop
+    MOVF RequestLength,W
+    ADDLW 0xFF              ; Subtract address byte
+    MOVWF BytesLeft
+    MOVLW RxBuffer+1
+    BANKSEL FSR
+    MOVWF FSR
+
+WriteLoop:
+    ; Send each data byte from the received UART payload
+    BANKSEL INDF
+    MOVF INDF,W
+    CALL I2CSend              ; Send the next I2C data byte
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO WriteStop
+    BANKSEL FSR
+    INCF FSR,F
+    BANKSEL BytesLeft
+    DECFSZ BytesLeft,F
+    GOTO WriteLoop
+
+WriteStop:
+    CALL I2CStop
+    GOTO FinishI2C
+
+ReadCommand:
+    ; Read command requires an address and one read-count byte
+    MOVF RequestLength,W
+    XORLW 2
+    BTFSS STATUS,2
+    GOTO InvalidLength
+
+    ; Do not allow a zero-byte read
+    MOVF RxBuffer+1,F       ; Reject read count zero
+    BTFSC STATUS,2
+    GOTO InvalidLength
+
+    ; Maximum read count is 23 bytes
+    MOVF RxBuffer+1,W
+    SUBLW MaxRead           ; Reject counts above 23
+    BTFSS STATUS,0
+    GOTO InvalidLength
+    CALL CheckAddress
+    MOVF ErrorCategory,F
+    BTFSS STATUS,2
+    GOTO SendValidationError
+
+    CALL BeginI2C
+    MOVF RxBuffer+1,W
+    MOVWF BytesLeft
+    ADDLW 1                 ; Reply payload = status + read bytes
+    MOVWF ReplyLength
+    CALL I2CStart
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO ReadStop
+    MOVF AddressRead,W
+    CALL I2CSend
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO ReadStop
+
+    MOVLW TxBuffer+1
+    BANKSEL FSR
+    MOVWF FSR
+
+ReadLoop:
+    ; Read the next I2C data byte into the UART reply buffer
+    CALL I2CReceive           ; Receive the next I2C data byte
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO ReadStop
+    MOVF RxByte,W
+    BANKSEL INDF
+    MOVWF INDF
+    INCF FSR,F
+    BANKSEL BytesLeft
+    DECFSZ BytesLeft,F
+    GOTO ReadNextByte
+    
+    ; Last received byte gets master NACK
+    CALL I2CNack              ; NACK after the final received byte
+    GOTO ReadStop
+
+ReadNextByte:
+    ; ACK the received byte when more data is needed
+    CALL I2CAck               ; ACK because more bytes are needed
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO ReadStop
+    GOTO ReadLoop
+
+ReadStop:
+    CALL I2CStop
+    GOTO FinishI2C
+
+CheckAddress:
+    ; Check Address and Request Lengths
+    BANKSEL ErrorCategory
+    CLRF ErrorCategory
+    MOVF RxBuffer,W
+    MOVWF DeviceAddress
+    
+    ; Only allow ordinary 7-bit I2C addresses from 0x08 to 0x77
+    ; Reject reserved addresses below 0x08
+    MOVLW 0x08
+    SUBWF DeviceAddress,W   ; C=1 if device address >= 0x08
+    BTFSS STATUS,0
+    GOTO InvalidAddress
+
+    ; Reject reserved addresses above 0x77
+    MOVF DeviceAddress,W
+    SUBLW 0x77              ; C=1 if address <= 0x77
+    BTFSS STATUS,0
+    GOTO InvalidAddress
+    
+    ; Shift address left and add R/W bit for I2C
+    MOVF DeviceAddress,W
+    MOVWF AddressWrite
+    BCF STATUS,0
+    RLF AddressWrite,F
+    MOVF AddressWrite,W
+    MOVWF AddressRead
+    BSF AddressRead,0
+    RETURN
+
+; Return bridge validation error for invalid address
+InvalidAddress:
+    MOVLW 0x05
+    MOVWF ErrorCategory
+    MOVLW 0x03
+    MOVWF ErrorDetail
+    RETURN
+
 ; Return bridge validation error for invalid packet length
 InvalidLength:
     BANKSEL ErrorCategory
@@ -386,3 +562,266 @@ InvalidLength:
 SendValidationError:
     CALL SendErrorPacket
     RETURN
+
+BeginI2C:
+    ; Set the default response to a successful one-byte status
+    BANKSEL I2CError
+    CLRF I2CError
+    MOVLW 1
+    MOVWF ReplyLength       ; Default success reply: status only
+    CLRF TxBuffer           ; Success status = 00
+    BANKSEL PORTA
+    BCF PORTA,0             ; Clear previous error LED
+    BSF PORTA,1             ; Transaction active
+    RETURN
+
+FinishI2C:
+    ; Finish the transaction and choose success or error reply
+    BANKSEL PORTA
+    BCF PORTA,1             ; Transaction finished
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    GOTO I2CFailure
+    
+    ; Read replies keep their status byte and returned data bytes
+    CALL SendReply
+    RETURN
+
+I2CFailure:
+    ; Save the I2C error and reset MSSP for the next command
+    MOVF I2CError,W
+    MOVWF ErrorDetail
+    MOVLW 0x04
+    MOVWF ErrorCategory
+    CALL ResetMSSP
+    CALL SendErrorPacket
+    RETURN
+
+ResetMSSP:
+    ; Reset the I2C hardware after a failed transaction
+    BANKSEL SSPCON
+    CLRF SSPCON
+    BANKSEL SSPCON2
+    CLRF SSPCON2
+    BANKSEL PIR1
+    BCF PIR1,3
+    BANKSEL SSPCON
+    MOVLW 0x28
+    MOVWF SSPCON
+    RETURN
+
+I2CStart:
+    ; I2C Hardware Routines, generate an I2C START condition
+    BANKSEL PORTC
+    BTFSS PORTC,3
+    GOTO SCLHeldLow
+    BTFSS PORTC,4
+    GOTO BusLow
+    BANKSEL PIR1
+    BCF PIR1,3
+    BANKSEL SSPCON2
+    BSF SSPCON2,0           ; SEN=1
+    CALL WaitSSPIF
+    RETURN
+
+SCLHeldLow:
+    ; Report error if SCL cannot return HIGH
+    BANKSEL I2CError
+    MOVLW 4
+    MOVWF I2CError
+    BANKSEL PORTA
+    BSF PORTA,0
+    RETURN
+
+BusLow:
+    ; Report error if the I2C bus is not idle
+    BANKSEL I2CError
+    MOVLW 3
+    MOVWF I2CError
+    BANKSEL PORTA
+    BSF PORTA,0
+    RETURN
+
+I2CSend:
+    ; Clear the I2C event flag
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Send the byte currently stored in W
+    BANKSEL SSPBUF
+    MOVWF SSPBUF
+    CALL WaitSSPIF
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    RETURN
+
+    ; Check whether the slave acknowledged the byte
+    BANKSEL SSPCON2
+    BTFSS SSPCON2,6        ; ACKSTAT=0 means slave ACK
+    RETURN
+    BANKSEL I2CError
+    MOVLW 1                 ; Address/data NACK
+    MOVWF I2CError
+    BANKSEL PORTA
+    BSF PORTA,0
+    RETURN
+
+I2CReceive:
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Enable hardware receiver
+    BANKSEL SSPCON2
+    BSF SSPCON2,3           ; RCEN=1, receive one byte
+    CALL WaitSSPIF
+    BANKSEL I2CError
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    RETURN
+    BANKSEL SSPBUF
+    MOVF SSPBUF,W
+    BANKSEL RxByte
+    MOVWF RxByte
+    RETURN
+
+I2CAck:
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Set ACKDT LOW and begin the ACK cycle
+    BANKSEL SSPCON2
+    BCF SSPCON2,5           ; ACKDT=0
+    BSF SSPCON2,4           ; ACKEN=1
+    CALL WaitSSPIF
+    RETURN
+
+I2CNack:
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Set ACKDT HIGH and begin the NACK cycle
+    BANKSEL SSPCON2
+    BSF SSPCON2,5           ; ACKDT=1 (normal last-byte NACK)
+    BSF SSPCON2,4           ; ACKEN=1
+    CALL WaitSSPIF
+    RETURN
+
+I2CStop:
+    BANKSEL PIR1
+    BCF PIR1,3
+
+    ; Ask the MSSP to generate STOP
+    BANKSEL SSPCON2
+    BSF SSPCON2,2           ; PEN=1
+    CALL WaitSSPIF
+    RETURN
+
+WaitSSPIF:
+    ; Wait for I2C hardware with a limited timeout
+    ; Load the two timeout counters
+    BANKSEL WaitCount
+    MOVLW 0xFF
+    MOVWF WaitCount
+    MOVWF WaitOuter
+
+WaitI2C:
+    ; Check SSPIF and decrease timeout counters
+    BANKSEL PIR1
+    BTFSC PIR1,3
+    GOTO I2CDone
+    BANKSEL WaitCount
+    DECFSZ WaitCount,F
+    GOTO WaitI2C
+    DECFSZ WaitOuter,F
+    GOTO WaitI2C
+    
+    ; Do not replace an error that was already detected
+    MOVF I2CError,F
+    BTFSS STATUS,2
+    RETURN
+    BANKSEL PORTC
+    BTFSS PORTC,3
+    GOTO SCLHeldLow
+    BANKSEL I2CError
+    MOVLW 2                 ; I2C operation timeout
+    MOVWF I2CError
+    BANKSEL PORTA
+    BSF PORTA,0
+    RETURN
+
+I2CDone:
+    ; Clear I2C interrupt flag after successful operation
+    BANKSEL PIR1
+    BCF PIR1,3
+    RETURN
+
+UARTSend:
+    ; Send the byte in W through UART to the PC
+    ; Keep the byte while checking TXIF
+    BANKSEL SendByte
+    MOVWF SendByte            ; Save UART transmit byte
+
+WaitTX:
+    ; Wait for UART transmit buffer to be available
+    BANKSEL PIR1
+    BTFSS PIR1,4            ; TXIF=1 when TXREG is available
+    GOTO WaitTX
+    BANKSEL SendByte
+    MOVF SendByte,W
+    BANKSEL TXREG
+    MOVWF TXREG
+    RETURN
+
+SendReply:
+    ; Send header, command, length, and reply payload
+    ; Send 0x24, command, and length first
+    MOVLW StartByte
+    CALL UARTSend
+    BANKSEL CommandByte
+    MOVF CommandByte,W
+    CALL UARTSend
+    BANKSEL ReplyLength
+    MOVF ReplyLength,W
+    CALL UARTSend
+    BANKSEL BytesLeft
+    MOVF ReplyLength,W
+    MOVWF BytesLeft
+    MOVLW TxBuffer
+    BANKSEL FSR
+    MOVWF FSR
+
+SendReplyLoop:
+    ; Send each byte from the reply buffer
+    BANKSEL BytesLeft
+    MOVF BytesLeft,F
+    BTFSC STATUS,2
+    RETURN
+    BANKSEL INDF
+    MOVF INDF,W
+    CALL UARTSend
+    BANKSEL FSR
+    INCF FSR,F
+    BANKSEL BytesLeft
+    DECFSZ BytesLeft,F
+    GOTO SendReplyLoop
+    RETURN
+
+SendErrorPacket:
+    ; Send UART/I2C/validation error information to the GUI
+    MOVLW StartByte
+    CALL UARTSend
+    MOVLW 0x45
+    CALL UARTSend
+    MOVLW 0x02
+    CALL UARTSend
+    BANKSEL ErrorCategory
+    MOVF ErrorCategory,W
+    CALL UARTSend
+    BANKSEL ErrorDetail
+    MOVF ErrorDetail,W
+    CALL UARTSend
+    RETURN
+
+END
