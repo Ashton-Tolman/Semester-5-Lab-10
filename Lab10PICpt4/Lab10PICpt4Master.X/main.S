@@ -49,7 +49,6 @@
 
 ; UART Command Settings
     StartByte     EQU 0x24         ; UART packet header (0x24)
-    MaxPayload    EQU 24           ; Maximum accepted UART payload length
     MaxRead       EQU 23           ; Maximum number of I2C bytes read
 
 ; Reset Vector
@@ -202,20 +201,6 @@ ClearWait:
     BTFSS INTCON,2
     GOTO ClearLoop
     RETURN
-
-UARTsend:
-    BANKSEL SendByte
-    MOVWF SendByte
-   
-UARTsendTWO:
-    BANKSEL PIR1
-    BTFSS PIR1,4
-    GOTO UARTsendTWO
-    BANKSEL SendByte
-    MOVF SendByte,W
-    BANKSEL TXREG
-    MOVWF TXREG
-    RETURN
    
 Timeout:
     BANKSEL RxState
@@ -322,7 +307,7 @@ PacketReady:
     ; Reject any payload longer than 24 bytes before using I2C
     BANKSEL RequestLength
     MOVF RequestLength,W
-    SUBLW 0x24
+    SUBLW 24
     BTFSS STATUS,0
     GOTO InvalidLength
 
